@@ -1,7 +1,9 @@
 # TODO — `pert.c`, perturbation Mandelbrot
 
 Goal: zoom far past the fp64 wall (span ~1e-13) using perturbation theory, on
-this hardware (1680x1050, 2080 Super, D3D12/Mesa, ~2 s GPU watchdog).
+this hardware (1680x1050, 2080 Super, D3D12/Mesa, ~2 s GPU watchdog). Real-time
+target: deepest zoom while keeping frame times near interactive (GPU watchdog
+~2 s), prioritizing membership-exactness over colour fidelity.
 `mandelbrot.c` is **not** modified — this is a separate program.
 
 ## Design (revised after Phase 0 measurements)
@@ -63,6 +65,12 @@ it; it matches `-wprec 2` (exact double reference) to within a count of 1-4 on
 reference reaches `z` as ~2*N*eps_ref, and since it is multiplied by `w`
 rather than by `2*Z`, it does *not* amplify exponentially; in c-space it works
 out to ~N*eps_ref*delta, a fixed fraction of a pixel.
+
+**Rescaling note:** Full dynamic rescaling ($z=Sw \implies w \to 2Zw + S w^2 + d$)
+with floatexp when $|Z|$ is small (DEEPZOOM.md) is not implemented here. The
+hi/lo reference table plus fp64 perturbation $w$ has been sufficient to reach
+span 1e-50 in verification; revisit only if double-range underflow becomes the
+actual limiting factor for deeper zooms.
 
 **Coordinate**: `delta` must come from the *exact integer* pixel offset
 `(gl_FragCoord.xy - res*0.5)`, never `uv-0.5` (cancels catastrophically at
