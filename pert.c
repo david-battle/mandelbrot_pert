@@ -252,19 +252,20 @@ static void RefUpload(void)
     refUploaded = refFilled;
 }
 
-// Does c's own orbit stay bounded for n iterations? This is the criterion for a
-// usable reference, and it is exactly the orbit the table then stores, so a
-// candidate accepted here can never fail while its table is being extended.
-static int RefSurvives(double cx, double cy, int n)
+// Return how many iterations the orbit survives up to maxn (>=0). 0 means
+// escapes immediately or on first step? survives 0 iterations means bounded
+// for 0 steps (trivial) - better: returns count of iterations completed before
+// escape, capped at maxn. If it reaches maxn, returns maxn.
+static int RefSurvivesCount(double cx, double cy, int maxn)
 {
     double zr = 0.0, zi = 0.0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < maxn; i++) {
         double t = zr*zr - zi*zi + cx;
         zi = 2.0*zr*zi + cy;
         zr = t;
-        if (zr*zr + zi*zi > 4.0) return 0;
+        if (zr*zr + zi*zi > 4.0) return i;
     }
-    return 1;
+    return maxn;
 }
 
 // Extend the table to `need` entries. Entry i holds z_i split as two floats per
@@ -372,16 +373,37 @@ static int RefFind(double cx, double cy, double span, double aspect,
                    int sw, int sh, int need, int radiusPx)
 {
     double pxStep = span*aspect/sw, pyStep = span/sh;
+    int bestCnt = -1;
+    double bestPx = cx, bestPy = cy;
+    double bestDist2 = 1e18;
     for (int r = 0; r <= radiusPx; r++) {
         for (int dy = -r; dy <= r; dy++) {
             for (int dx = -r; dx <= r; dx++) {
                 if (r > 0 && abs(dx) != r && abs(dy) != r) continue;
                 double px = cx + dx*pxStep, py = cy + dy*pyStep;
-                if (!RefSurvives(px, py, need)) continue;
-                RefAdopt(px, py, need);
-                if (refValid) return 1;
+                int cnt = RefSurvivesCount(px, py, need);
+                if (cnt <= 0) continue;
+                double d2 = (double)dx*dx + (double)dy*dy;
+                // Prefer higher survival count; if tie, prefer closer
+                int isBetter = 0;
+                if (cnt > bestCnt) isBetter = 1;
+                else if (cnt == bestCnt && d2 < bestDist2 - 1e-18) isBetter = 1;
+                if (isBetter || bestCnt < 0) {
+                    bestCnt = cnt;
+                    bestPx = px; bestPy = py;
+                    bestDist2 = d2;
+                    if (bestCnt >= need) {
+                        RefAdopt(bestPx, bestPy, need);
+                        if (refValid) return 1;
+                    }
+                }
             }
         }
+        if (bestCnt >= need) break;
+    }
+    if (bestCnt > 0) {
+        RefAdopt(bestPx, bestPy, need);
+        if (refValid) return 1;
     }
     refValid = 0;
     return 0;
@@ -700,10 +722,27 @@ int main(int argc, char **argv)
         if (want > ITER_HARD_MAX) want = ITER_HARD_MAX;
         int iter = want;
         if (!shot) {
+            // Screen-wide survival estimate (Defect 3).
+            // A repelling reference beside a minibrot can falsely leave refAttracting=false
+            // while the screen is packed with interior pixels, leading to a watchdog reset.
+            // We sample a 3x3 grid across the view to see if the screen is actually hard.
+            bool screenInterior = false;
+            int cap = WorstCaseIterations();
+            int survived = 0;
+            double pxStep = span * aspect * 0.4;
+            double pyStep = span * 0.4;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (RefSurvivesCount(cx + dx * pxStep, cy + dy * pyStep, cap) >= cap) {
+                        survived++;
+                    }
+                }
+            }
+            if (survived >= 5) screenInterior = true;
+
             // Predictive half of the governor: keep the *first* frame of an
-            // attracting view inside the watchdog, not just the ones after it.
-            if (refAttracting) {
-                int cap = WorstCaseIterations();
+            // attracting or dense view inside the watchdog, not just the ones after it.
+            if (refAttracting || screenInterior) {
                 if (want > cap) {
                     // Once per adopted reference. Guarding on the *wanted* value
                     // instead logged on every zoom step, since AutoIterations
@@ -746,10 +785,22 @@ int main(int argc, char **argv)
 
         int path;
         if (pathMode == MODE_AUTO) {
-            // fp32 while anything is moving (it is ~60x cheaper at 1/64 fp64
-            // rate on this GPU), fp64 once the view has settled.
-            if (refMax <= 0) path = PATH_FP64_DIRECT;
-            else path = moving ? PATH_PERT32 : PATH_PERT64;
+            // Capability-aware selection: avoid poor-quality marginal references
+            // when direct fp64 is still viable; use perturbation only when
+            // reference is good or when deep beyond direct's wall.
+            if (refMax <= 0) {
+                path = PATH_FP64_DIRECT;
+            } else {
+                int marginal = (refShortFor > 0);
+                // Direct fp64 degrades around ~1e-13; use threshold to prefer
+                // direct for moderate spans even if we found a short reference.
+                const double DIRECT_VIABLE = 1e-11;
+                if (marginal && span > DIRECT_VIABLE) {
+                    path = PATH_FP64_DIRECT;
+                } else {
+                    path = moving ? PATH_PERT32 : PATH_PERT64;
+                }
+            }
         } else if (pathMode == MODE_DIRECT64) {
             path = PATH_FP64_DIRECT;
         } else {
